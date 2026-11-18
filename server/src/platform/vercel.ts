@@ -55,6 +55,7 @@ const platform: Platform = {
   name: "vercel",
   segment: budget,
   background: budget,
+  backgroundOnDeadline: true, // a step longer than one capped segment keeps going in background mode (chained)
   async startBackground({ origin, runId, token }) {
     const res = await fetch(`${origin}/api/internal/runs/${encodeURIComponent(runId)}/drive`, { method: "POST", headers: selfHeaders(token) });
     if (res.status >= 400) throw new Error(`無法啟動背景執行（HTTP ${res.status}）`);
