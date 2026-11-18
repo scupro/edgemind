@@ -62,7 +62,16 @@ export interface SegmentBudget {
 
 export interface SegmentOptions extends SegmentBudget {
   emit?: (e: AgentEvent) => void;
+  /**
+   * Stream-mode runs on platforms with a hard wall-clock cap (Netlify ≈60 s): when a model step is cut by the hard
+   * deadline, switch the run to background mode instead of redoing the same step in another capped segment, where a
+   * long answer would be cut again forever. The client's `continue` then gets 202 and follows the step log.
+   */
+  backgroundOnDeadline?: boolean;
 }
+
+/** A model step only starts when at least this much of the hard deadline is left (else pause first, fresh segment). */
+export const MIN_MODEL_STEP_MS = 30_000;
 
 export interface SegmentOutcome {
   status: RunStatus;
@@ -343,6 +352,8 @@ async function segmentBody(
   };
 
   let modelStepsThisSegment = 0;
+  /** Something was persisted in this segment (a model step or a batch of tool results): pausing now still advances. */
+  let progressed = false;
   const fileCache = new Map<string, Part>();
   let lastInputTokens = 0;
   const memSettings = await getMemorySettings(db);
@@ -527,12 +538,18 @@ async function segmentBody(
       cp.leafId = row.id;
       cp.pending = undefined;
       await saveCp();
+      progressed = true;
     }
 
     // ---------- 2. limits ----------
     if (stepCount >= run.maxSteps) return finalize("completed", "max_steps");
     if (modelStepsThisSegment > 0 && elapsed() >= opts.softMs) return pause("budget");
     if (deadlineSignal.aborted) return pause("deadline");
+    // Don't start a model step that the hard deadline would cut mid-stream (its output would be thrown away and
+    // regenerated): hand it a fresh segment instead. Only after progress, so a segment always moves the run forward.
+    if (deadline !== undefined && progressed && deadline - Date.now() < Math.min(MIN_MODEL_STEP_MS, (opts.hardMs ?? 0) * 0.6)) {
+      return pause("budget");
+    }
     if (fullCaps) {
       if (fullCaps.maxSteps && stepCount >= fullCaps.maxSteps) return finalize("completed", "full_mode_step_cap");
       if (fullCaps.maxTokens || fullCaps.maxCostUsd) {
@@ -599,6 +616,7 @@ async function segmentBody(
       if (ev.type !== "finish" && ev.type !== "error") emit(ev);
     }
     modelStepsThisSegment++;
+    if (!b.error) progressed = true;
 
     if (b.error?.code === "aborted") {
       if (stopSignal.aborted) {
@@ -609,6 +627,14 @@ async function segmentBody(
           emit({ type: "message", message: toMessageDTO(row) });
         }
         return finalizeStopped();
+      }
+      if (opts.backgroundOnDeadline && run.mode === "stream") {
+        // The step alone outlasts a capped segment: finish it in background mode (long budget) instead of looping.
+        const ok = await transition(db, runId, ["running"], { status: "paused", mode: "background", checkpoint: cp, stepCount });
+        if (!ok) return finalizeStopped();
+        await appendStep(db, runId, "continue", { reason: "deadline", mode: "background" });
+        emit({ type: "continue", runId, mode: "background" });
+        return { status: "paused", reason: "deadline_background" };
       }
       return pause("deadline"); // step is redone next segment
     }

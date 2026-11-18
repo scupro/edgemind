@@ -59,6 +59,6 @@ export type AgentEvent =
   | { type: "tool-result"; callId: string; name: string; result: unknown; isError?: boolean }
   | { type: "approval-required"; approvals: PendingApprovalDTO[] }
   /** Segment budget reached: re-POST /api/chat { runId, action: "continue" } to resume seamlessly. */
-  | { type: "continue"; runId: string }
+  | { type: "continue"; runId: string; /** the run moved to background mode: the next POST answers 202 */ mode?: "background" }
   | { type: "done"; status: RunStatus; reason?: string }
   | { type: "error"; error: LlmErrorInfo };

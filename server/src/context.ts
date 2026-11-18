@@ -19,6 +19,11 @@ export interface Platform {
    * HMAC token in x-edgemind-drive). Default: run in-process via waitUntil.
    */
   startInternal?(args: { origin: string; path: string; token: string; c: Ctx }): Promise<void>;
+  /**
+   * Streamed segments have a hard wall-clock cap here: a model step cut by it moves the run to background mode
+   * instead of being redone in another capped segment (see SegmentOptions.backgroundOnDeadline).
+   */
+  backgroundOnDeadline?: boolean;
   /** When true, the internal drive endpoint runs the run inline (Netlify background function). */
   driveInline?: boolean;
 }

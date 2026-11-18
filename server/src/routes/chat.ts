@@ -167,6 +167,18 @@ export interface ChatApi {
 export function mountChat(app: Hono<HonoEnv>, deps: AppDeps): ChatApi {
   const registry = deps.tools ?? builtinRegistry();
   const segmentBudget = deps.platform?.segment ?? DEFAULT_SEGMENT;
+  /**
+   * Segment options for a streamed request that started at `t0`: the platform's wall-clock cap counts from the request,
+   * not from runSegment, so the time already spent here (skills, settling runs, model lookup on a cold DB) comes off.
+   */
+  const segmentOpts = (t0: number) => {
+    const spent = Date.now() - t0;
+    return {
+      softMs: Math.max(0, segmentBudget.softMs - spent),
+      ...(segmentBudget.hardMs !== undefined ? { hardMs: Math.max(1, segmentBudget.hardMs - spent) } : {}),
+      ...(deps.platform?.backgroundOnDeadline ? { backgroundOnDeadline: true } : {}),
+    };
+  };
   const backgroundBudget = deps.platform?.background ?? DEFAULT_BACKGROUND;
 
   const agentEnv = (c: Ctx): AgentEnv => ({
@@ -252,6 +264,7 @@ export function mountChat(app: Hono<HonoEnv>, deps: AppDeps): ChatApi {
   }
 
   app.post("/chat", async (c) => {
+    const t0 = Date.now();
     const body = await c.req.json().catch(() => null);
     if (!body || typeof body !== "object") throw new BadInput("請求格式錯誤");
     const database = c.get("database");
@@ -269,7 +282,7 @@ export function mountChat(app: Hono<HonoEnv>, deps: AppDeps): ChatApi {
         return c.json({ runId: run.id, conversationId: run.conversationId, status: run.status }, 202);
       }
       const env = agentEnv(c);
-      return sse(c, (emit) => runSegment(env, run.id, { ...segmentBudget, emit }));
+      return sse(c, (emit) => runSegment(env, run.id, { ...segmentOpts(t0), emit }));
     }
 
     // ----- new turn: new message, edit-and-branch, or regenerate -----
@@ -342,7 +355,7 @@ export function mountChat(app: Hono<HonoEnv>, deps: AppDeps): ChatApi {
       return c.json({ runId: run.id, conversationId, userMessageId, status: "pending" }, 202);
     }
     const env = agentEnv(c);
-    return sse(c, (emit) => runSegment(env, run.id, { ...segmentBudget, emit }));
+    return sse(c, (emit) => runSegment(env, run.id, { ...segmentOpts(t0), emit }));
   });
 
   app.get("/runs/:id", async (c) => {

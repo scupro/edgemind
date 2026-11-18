@@ -49,7 +49,9 @@ const startInternal: NonNullable<Platform["startInternal"]> = async ({ origin, p
 
 const app = createApp({
   getDatabase: (env) => createNeonDatabase(env.DATABASE_URL),
-  platform: { name: "netlify", segment: { softMs: 50_000, hardMs: 57_000 }, startBackground, startInternal },
+  // Sync/streaming functions are cut at 60 s from the request. 40 s soft / 50 s hard (counted from the request) leaves
+  // room to persist the step log and emit `continue` before Netlify ends the response.
+  platform: { name: "netlify", segment: { softMs: 40_000, hardMs: 50_000 }, backgroundOnDeadline: true, startBackground, startInternal },
 });
 
 /** Same app, configured to drive runs inline with the background-function budget. */

@@ -323,6 +323,28 @@ describe("segments, stop, background", () => {
     expect(msgs.filter((m) => m.role === "assistant").map((m) => m.parts)).toEqual([[{ type: "text", text: "快" }]]);
   });
 
+  it("backgroundOnDeadline: a model step cut by the hard deadline moves the run to background instead of redoing it", async () => {
+    const { chat, c } = makeClient({ name: "test", segment: { softMs: 0, hardMs: 120 }, background: { softMs: 60_000 }, backgroundOnDeadline: true });
+    script = [slowText(["慢", "慢", "慢", "慢"], 60), text("完成")];
+    const r1 = await chat({ content: "長回答", modelId: modelRowId });
+    const runId = runIdOf(r1.events);
+    expect(last(r1.events)).toEqual({ type: "continue", runId, mode: "background" });
+    const [row] = await t.database.db.select().from(runs).where(eq(runs.id, runId));
+    expect(row.mode).toBe("background");
+    expect(row.status).toBe("paused");
+    // the page's automatic `continue` is answered with 202: the step finishes in background mode
+    const r2 = await chat({ runId, action: "continue" });
+    expect(r2.status).toBe(202);
+    let status = "";
+    for (let i = 0; i < 100 && status !== "completed"; i++) {
+      status = (await c.get(`/runs/${runId}`)).body.status;
+      if (status !== "completed") await sleep(30);
+    }
+    expect(status).toBe("completed");
+    const msgs = await t.database.db.select().from(messages).where(eq(messages.conversationId, convOf(r1.events)));
+    expect(msgs.filter((m) => m.role === "assistant").map((m) => m.parts)).toEqual([[{ type: "text", text: "完成" }]]);
+  });
+
   it("stop during streaming keeps the partial answer", async () => {
     const { open, c } = makeClient();
     script = [slowText(Array.from({ length: 40 }, (_, i) => `字${i}`), 25)];
