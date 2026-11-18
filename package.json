@@ -13,6 +13,7 @@
     "dev:api": "npm run dev -w server",
     "build": "npm run gen:migrations -w server && npm run build -w web && npm run build:functions",
     "build:functions": "node scripts/build-functions.mjs",
+    "build:vercel": "npm run gen:migrations -w server && npm run build -w web && node scripts/build-vercel.mjs",
     "test": "npm run test -w server",
     "typecheck": "tsc -p shared && tsc -p server && tsc -p web --noEmit",
     "db:generate": "npm run db:generate -w server",

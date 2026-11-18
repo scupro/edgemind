@@ -6,6 +6,7 @@ EdgeMind 是一個**單人自用、自架、Serverless** 的 AI Agent 工作台�
 
 - **主要部署平台：Netlify**（Functions + Background Functions + Scheduled Functions）
 - **次要部署平台：Cloudflare Pages**（同一份程式，透過平台適配層掛載）
+- **也可部署到 Vercel**（Build Output API＋Fluid compute，不使用 Vercel AI SDK／AI Gateway），見 [docs/deploy-vercel.md](docs/deploy-vercel.md)
 - **資料：Neon Postgres（含 pgvector）＋ 任何 S3 相容物件儲存**（Neon Object Storage、Cloudflare R2、Backblaze B2、MinIO、AWS S3…）
 - **介面：正體中文**，淺色／深色／跟隨系統，可安裝為 PWA
 

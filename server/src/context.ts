@@ -2,9 +2,9 @@ import type { Context } from "hono";
 import type { Database } from "./db/client";
 import type { AppEnv } from "./env";
 
-/** Platform hooks provided by netlify.ts / cloudflare.ts (or tests). */
+/** Platform hooks provided by netlify.ts / cloudflare.ts / vercel.ts (or tests). */
 export interface Platform {
-  name: "netlify" | "cloudflare" | "node" | "test";
+  name: "netlify" | "cloudflare" | "vercel" | "node" | "test";
   /** Time budget of one streamed /api/chat segment. Default: soft 50s, hard 57s (Netlify 60s cap). */
   segment?: { softMs: number; hardMs?: number };
   /** Time budget of one background drive invocation. */

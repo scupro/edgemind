@@ -10,6 +10,7 @@ coverage/
 # 平台本機狀態
 .netlify/
 .wrangler/
+.vercel/
 .dev.vars
 .dev.vars.*
 

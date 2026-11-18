@@ -25,6 +25,7 @@ Only these come from the environment (see [`.env.example`](.env.example)); every
 ## Deploy
 
 - Netlify: [docs/deploy-netlify.md](docs/deploy-netlify.md)
+- Vercel: [docs/deploy-vercel.md](docs/deploy-vercel.md) — Build Output API + Fluid compute; no Vercel AI SDK, no AI Gateway.
 - Cloudflare Pages: [docs/deploy-cloudflare.md](docs/deploy-cloudflare.md) — note the free plan's 10 ms CPU / 50 subrequests per request limits.
 - Post-deploy checks: [docs/verification-checklist.md](docs/verification-checklist.md)
 - All settings: [docs/configuration.md](docs/configuration.md)
