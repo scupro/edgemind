@@ -20,20 +20,22 @@
 import type { Hono } from "hono";
 import { desc, eq } from "drizzle-orm";
 import type { ScheduledTaskDTO, ScheduledTaskRunDTO, CronSettingsDTO } from "../../../shared/src/index";
-import type { Ctx, HonoEnv } from "../context";
+import type { AppDeps, Ctx, HonoEnv } from "../context";
 import type { ChatApi } from "./chat";
 import { models, projects, scheduledTasks, settings, auditLogs } from "../db/schema";
 import { BadInput } from "../lib/errors";
-import { decryptSecret, encryptSecret, hmacHex, randomToken, timingSafeEqual } from "../lib/crypto";
+import { decryptSecret, encryptSecret, randomToken, timingSafeEqual } from "../lib/crypto";
 import { getSetting } from "../lib/settings";
 import { isPermissionMode } from "../agent/permissions";
 import { describeSpec, nextRun, ScheduleError, validateSpec, type ScheduleSpec } from "../scheduler/cron";
 import { history, lastStatuses, recordExecution, tick } from "../scheduler/service";
+import { cronInternalToken, readLastCheck, writeSchedulerHint } from "../scheduler/hint";
+import { s3For } from "./files";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (v: unknown): v is string => typeof v === "string" && UUID.test(v);
 
-export const cronInternalToken = (secret: string) => hmacHex(secret, "cron-tick");
+export { cronInternalToken };
 const TOKEN_AAD = "cron_token";
 
 type Row = typeof scheduledTasks.$inferSelect;
@@ -68,7 +70,10 @@ async function readToken(c: Ctx): Promise<string | null> {
   }
 }
 
-export function mountSchedules(app: Hono<HonoEnv>, chat: ChatApi) {
+export function mountSchedules(app: Hono<HonoEnv>, chat: ChatApi, deps: AppDeps = {} as AppDeps) {
+  /** Keep the idle-tick hint (object storage) in step with the database: see scheduler/hint.ts. */
+  const refreshHint = async (c: Ctx) => writeSchedulerHint(c.get("database"), s3For(c, deps), c.get("env").JWT_SECRET, await readToken(c));
+
   const startRun = (c: Ctx) => (t: { name: string; prompt: string; projectId: string | null; modelId: string | null; permissionMode: string | null }) =>
     chat.startConversationRun(c, { prompt: t.prompt, title: `[排程] ${t.name}`, projectId: t.projectId, modelId: t.modelId, permissionMode: t.permissionMode });
 
@@ -147,6 +152,7 @@ export function mountSchedules(app: Hono<HonoEnv>, chat: ChatApi) {
     if (!body || typeof body !== "object") throw new BadInput("請求格式錯誤");
     const values = await parseBody(c, body);
     const [row] = await c.get("database").db.insert(scheduledTasks).values(values as typeof scheduledTasks.$inferInsert).returning();
+    await refreshHint(c);
     return c.json(toDTO(row), 201);
   });
 
@@ -164,6 +170,7 @@ export function mountSchedules(app: Hono<HonoEnv>, chat: ChatApi) {
     if (!body || typeof body !== "object") throw new BadInput("請求格式錯誤");
     const values = await parseBody(c, body, row);
     const [upd] = await c.get("database").db.update(scheduledTasks).set(values).where(eq(scheduledTasks.id, row.id)).returning();
+    await refreshHint(c);
     return c.json(toDTO(upd));
   });
 
@@ -171,6 +178,7 @@ export function mountSchedules(app: Hono<HonoEnv>, chat: ChatApi) {
     const row = await load(c);
     if (!row) return c.json({ error: "not_found", message: "找不到排程" }, 404);
     await c.get("database").db.delete(scheduledTasks).where(eq(scheduledTasks.id, row.id));
+    await refreshHint(c);
     return c.json({ ok: true });
   });
 
@@ -203,7 +211,11 @@ export function mountSchedules(app: Hono<HonoEnv>, chat: ChatApi) {
 
   // ----- dispatcher token -----
   app.get("/settings/cron", async (c) => {
-    const last = await getSetting<{ at: string; source: string }>(c.get("database"), "cron_last_tick");
+    const dbLast = await getSetting<{ at: string; source: string }>(c.get("database"), "cron_last_tick");
+    // idle ticks never reach the database: their time is kept next to the hint
+    const idleLast = await readLastCheck(s3For(c, deps)).catch(() => null);
+    const last = idleLast && (!dbLast || Date.parse(idleLast.at) > Date.parse(dbLast.at)) ? idleLast : dbLast;
+    await refreshHint(c);
     const out: CronSettingsDTO = { token: await readToken(c), lastTickAt: last?.at ?? null, lastTickSource: last?.source ?? null };
     return c.json(out);
   });
@@ -215,11 +227,13 @@ export function mountSchedules(app: Hono<HonoEnv>, chat: ChatApi) {
     await database.db.insert(settings).values({ key: "cron_token", value: null, secretEnc: enc })
       .onConflictDoUpdate({ target: settings.key, set: { secretEnc: enc, updatedAt: new Date() } });
     await database.db.insert(auditLogs).values({ action: "settings_change", detail: { key: "cron_token", op: "regenerate" } });
+    await refreshHint(c);
     return c.json({ token });
   });
 
   app.delete("/settings/cron/token", async (c) => {
     await c.get("database").db.delete(settings).where(eq(settings.key, "cron_token"));
+    await refreshHint(c);
     return c.json({ ok: true });
   });
 
@@ -229,7 +243,7 @@ export function mountSchedules(app: Hono<HonoEnv>, chat: ChatApi) {
     let source: string;
     if (internal) {
       if (!timingSafeEqual(internal, await cronInternalToken(c.get("env").JWT_SECRET))) return c.json({ error: "unauthorized" }, 401);
-      source = "netlify-scheduled";
+      source = c.req.header("x-edgemind-cron-source")?.slice(0, 40) || "netlify-scheduled";
     } else {
       const m = /^Bearer\s+(\S+)$/i.exec(c.req.header("authorization") ?? "");
       const given = m?.[1] ?? c.req.query("token") ?? "";
@@ -237,6 +251,8 @@ export function mountSchedules(app: Hono<HonoEnv>, chat: ChatApi) {
       if (!token || !given || !timingSafeEqual(given, token)) return c.json({ error: "unauthorized", message: token ? "token 錯誤" : "尚未產生排程 token" }, 401);
       source = c.req.header("x-edgemind-cron-source")?.slice(0, 40) || "external";
     }
-    return c.json(await tick(c.get("database"), startRun(c), { source }));
+    const result = await tick(c.get("database"), startRun(c), { source });
+    await refreshHint(c);
+    return c.json(result);
   });
 }

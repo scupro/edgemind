@@ -19,6 +19,7 @@ import { mountMemory } from "./routes/memory";
 import { mountSecrets } from "./routes/secrets";
 import { mountSchedules } from "./routes/schedules";
 import { mountUsage } from "./routes/usage";
+import { idleTick } from "./scheduler/hint";
 
 /** Migrations run at most once per isolate per database URL. */
 const migrated = new Map<string, Promise<void>>();
@@ -87,6 +88,23 @@ export function createApp(deps: AppDeps) {
     return c.json(body);
   });
 
+  // Dispatcher ticks with nothing due are answered from object storage, before the database middleware below (which
+  // runs migrations and would wake Neon). Anything else (a task due, no / stale hint) falls through to the real tick.
+  app.post("/cron/tick", async (c, next) => {
+    const v = checkEnv(c.env ?? {});
+    if (!v.ok || !v.env) return next();
+    const internal = c.req.header("x-edgemind-cron") ?? null;
+    const given = /^Bearer\s+(\S+)$/i.exec(c.req.header("authorization") ?? "")?.[1] ?? c.req.query("token") ?? null;
+    const source = c.req.header("x-edgemind-cron-source")?.slice(0, 40) || (internal ? "netlify-scheduled" : "external");
+    const r = await idleTick(v.env, { internal, given, source }, deps.s3Fetch).catch((e) => {
+      console.error("[edgemind] idle tick check failed", e);
+      return null;
+    });
+    if (r?.kind === "unauthorized") return c.json({ error: "unauthorized", ...(r.message ? { message: r.message } : {}) }, 401);
+    if (r?.kind === "idle") return c.json(r.body);
+    return next();
+  });
+
   // Everything else needs a valid env + migrated DB.
   app.use("*", async (c, next) => {
     const v = checkEnv(c.env ?? {});
@@ -113,7 +131,7 @@ export function createApp(deps: AppDeps) {
   mountMcp(app, deps);
   mountMemory(app, deps);
   mountSecrets(app);
-  mountSchedules(app, chatApi);
+  mountSchedules(app, chatApi, deps);
   mountUsage(app);
 
   app.notFound((c) => c.json({ error: "not_found" }, 404));

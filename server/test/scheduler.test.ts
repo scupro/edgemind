@@ -3,6 +3,10 @@ import { Harness, callsReply, textReply } from "./harness";
 import { describeSpec, localDayStart, nextCron, nextRun, parseCron, validateSpec, zonedToUtc } from "../src/scheduler/cron";
 import { tick } from "../src/scheduler/service";
 import { cronInternalToken } from "../src/routes/schedules";
+import { createApp } from "../src/app";
+import { HINT_KEY, HINT_MAX_AGE_MS } from "../src/scheduler/hint";
+import { TestClient } from "./helpers";
+import { S3Mock } from "./s3-mock";
 
 const iso = (t: number | null) => (t === null ? null : new Date(t).toISOString());
 const at = (s: string) => Date.parse(s);
@@ -64,7 +68,8 @@ describe("schedule math", () => {
   });
 });
 
-const h = new Harness();
+const s3 = new S3Mock();
+const h = new Harness({ deps: { s3Fetch: s3.fetch } });
 beforeAll(() => h.setup());
 afterAll(() => h.teardown());
 beforeEach(() => { h.script = []; h.llmBodies = []; });
@@ -79,7 +84,14 @@ async function waitRun(runId: string, statuses: string[]) {
   throw new Error(`run ${runId} did not reach ${statuses}`);
 }
 
-const makeDue = (id: string) => h.t.database.query("UPDATE scheduled_tasks SET next_run_at = now() - interval '1 minute' WHERE id = $1", [id]);
+// Direct DB edits bypass the routes that refresh the idle-tick hint: drop it like any out-of-band change must.
+const makeDue = async (id: string) => {
+  await h.t.database.query("UPDATE scheduled_tasks SET next_run_at = now() - interval '1 minute' WHERE id = $1", [id]);
+  s3.objects.delete(`edgemind/${HINT_KEY}`);
+  s3.objects.delete(HINT_KEY);
+};
+/** An app whose database explodes on first use: proves a request was answered without touching Postgres. */
+const dblessClient = () => new TestClient(createApp({ getDatabase: () => { throw new Error("database touched"); }, s3Fetch: s3.fetch }), h.env);
 
 describe("scheduled tasks API + dispatcher", () => {
   it("CRUD, preview, validation", async () => {
@@ -125,6 +137,42 @@ describe("scheduled tasks API + dispatcher", () => {
     // regenerating invalidates the old token
     await c.post("/settings/cron/token", {});
     expect((await c.req("POST", "/cron/tick", undefined, { csrf: false, headers: { cookie: "", authorization: `Bearer ${gen.body.token}` } })).status).toBe(401);
+  });
+
+  it("idle ticks are answered from the object-storage hint without touching the database", async () => {
+    const c = h.client();
+    const token = (await c.post("/settings/cron/token", {})).body.token as string;
+    const t = (await c.post("/schedules", { name: "閒置", prompt: "x", modelId: h.modelRowId, schedule: { type: "daily", time: "03:00", timezone: "UTC" } })).body;
+    const hmac = await cronInternalToken(h.env.JWT_SECRET);
+    const d = dblessClient();
+    const bearer = (tok: string, extra: Record<string, string> = {}) => ({ csrf: false, headers: { cookie: "", authorization: `Bearer ${tok}`, ...extra } });
+    const idle = await d.req("POST", "/cron/tick", undefined, bearer(token, { "x-edgemind-cron-source": "cron-worker" }));
+    expect(idle.status).toBe(200);
+    expect(idle.body).toMatchObject({ claimed: 0, idle: true });
+    expect(Date.parse(idle.body.nextDueAt)).toBeLessThanOrEqual(Date.parse(t.nextRunAt));
+    expect((await d.req("POST", "/cron/tick", undefined, bearer("wrong"))).status).toBe(401); // no DB wake-up either
+    expect((await d.req("POST", "/cron/tick", undefined, { csrf: false, headers: { cookie: "", "x-edgemind-cron": hmac } })).body.idle).toBe(true);
+    expect((await d.req("POST", "/cron/tick", undefined, { csrf: false, headers: { cookie: "", "x-edgemind-cron": "bad" } })).status).toBe(401);
+    // the 排程 page shows idle ticks too
+    await d.req("POST", "/cron/tick", undefined, bearer(token, { "x-edgemind-cron-source": "cron-worker" }));
+    expect((await c.get("/settings/cron")).body.lastTickSource).toBe("cron-worker");
+
+    // a stale hint is not trusted: the tick goes to the database
+    const key = [...s3.objects.keys()].find((k) => k.endsWith(HINT_KEY))!;
+    const hint = JSON.parse(new TextDecoder().decode(s3.objects.get(key)!.body));
+    s3.objects.set(key, { body: new TextEncoder().encode(JSON.stringify({ ...hint, updatedAt: new Date(Date.now() - HINT_MAX_AGE_MS - 1000).toISOString() })), contentType: "application/json" });
+    expect((await d.req("POST", "/cron/tick", undefined, bearer(token))).status).toBe(500);
+    expect((await c.req("POST", "/cron/tick", undefined, bearer(token))).status).toBe(200); // full tick rewrites the hint
+    expect((await d.req("POST", "/cron/tick", undefined, bearer(token))).body.idle).toBe(true);
+
+    // a due task always reaches the database (and runs)
+    await h.t.database.query("UPDATE scheduled_tasks SET next_run_at = now() - interval '1 minute' WHERE id = $1", [t.id]);
+    await c.req("PATCH", `/schedules/${t.id}`, { name: "閒置2" }); // any route write refreshes the hint from the DB
+    expect((await d.req("POST", "/cron/tick", undefined, bearer(token))).status).toBe(500);
+    // deleting the token is reflected without the database as well
+    await c.req("DELETE", `/schedules/${t.id}`);
+    await c.req("DELETE", "/settings/cron/token");
+    expect((await d.req("POST", "/cron/tick", undefined, bearer(token))).status).toBe(401);
   });
 
   it("due task → one background run in a new conversation, next_run_at advanced, no double runs", async () => {
