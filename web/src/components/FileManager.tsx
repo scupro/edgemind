@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
-import { Download, Eye, FilePlus, FileText, Folder, History, Loader2, RefreshCw, Trash2, Upload } from "lucide-react";
+import { Download, Eye, FileArchive, FilePlus, FileText, Folder, History, Loader2, RefreshCw, Trash2, Upload } from "lucide-react";
+import { zipSync } from "fflate";
 import { toast } from "sonner";
 import type { FileDTO, FileVersionDTO } from "@edgemind/shared";
 import { Button } from "@/components/ui/button";
@@ -10,6 +11,9 @@ import { ConfirmDialog, PromptDialog } from "@/components/PromptDialog";
 import { FileViewer } from "@/components/FileViewer";
 import { api } from "@/lib/api";
 import { uploadFile } from "@/lib/upload";
+
+/** Zipping happens in the browser, so keep the whole archive within what a tab can hold comfortably. */
+const MAX_ZIP_BYTES = 500 * 1024 ** 2;
 
 const fmtSize = (n: number) => (n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} KB` : n < 1024 ** 3 ? `${(n / 1024 ** 2).toFixed(1)} MB` : `${(n / 1024 ** 3).toFixed(2)} GB`);
 
@@ -30,6 +34,7 @@ export function FileManager({ projectId }: { projectId: string }) {
   const [viewing, setViewing] = useState<FileDTO | null>(null);
   const [creating, setCreating] = useState(false);
   const [drag, setDrag] = useState(false);
+  const [zipping, setZipping] = useState<string | null>(null);
   const input = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async () => {
@@ -73,6 +78,40 @@ export function FileManager({ projectId }: { projectId: string }) {
     }
   }
 
+  /** Download every current project file as one zip. Files come straight from object storage (presigned GET, same CORS as uploads)
+   *  and are zipped in the browser, so no platform response-size or memory limit applies on the server side. */
+  async function downloadAll() {
+    const list = rows ?? [];
+    if (!list.length || zipping) return;
+    const total = list.reduce((n, f) => n + f.size, 0);
+    if (total > MAX_ZIP_BYTES) {
+      toast.error(`專案檔案共 ${fmtSize(total)}，超過打包上限 ${fmtSize(MAX_ZIP_BYTES)}，請改為逐一下載`);
+      return;
+    }
+    const tree: Record<string, Uint8Array> = {};
+    try {
+      for (let i = 0; i < list.length; i++) {
+        const f = list[i];
+        setZipping(`${i + 1}/${list.length}`);
+        const { url } = await api<{ url: string }>(`/files/${f.id}/download`);
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`${f.path}：下載失敗（HTTP ${res.status}）`);
+        tree[f.path] = new Uint8Array(await res.arrayBuffer());
+      }
+      const zip = zipSync(tree, { level: 6 });
+      const href = URL.createObjectURL(new Blob([zip], { type: "application/zip" }));
+      const a = document.createElement("a");
+      a.href = href;
+      a.download = "project-files.zip";
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(href), 10_000);
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setZipping(null);
+    }
+  }
+
   const grouped = useMemo(() => {
     const g = new Map<string, FileDTO[]>();
     for (const r of rows ?? []) {
@@ -107,6 +146,7 @@ export function FileManager({ projectId }: { projectId: string }) {
             <Input value={folder} onChange={(e) => setFolder(e.target.value)} placeholder="上傳到資料夾（選填，例如 docs）" className="h-8 w-64" />
             <Button size="sm" onClick={() => input.current?.click()}><Upload /> 選擇檔案</Button>
             <Button size="sm" variant="outline" onClick={() => setCreating(true)}><FilePlus /> 新增文字檔</Button>
+            {!!rows?.length && <Button size="sm" variant="outline" onClick={downloadAll} disabled={!!zipping} title="把目前所有檔案打包成 zip 下載">{zipping ? <><Loader2 className="animate-spin" /> 打包中 {zipping}</> : <><FileArchive /> 全部打包下載</>}</Button>}
             <Button size="sm" variant="ghost" onClick={load} title="重新整理" aria-label="重新整理"><RefreshCw /></Button>
           </div>
           <input ref={input} type="file" multiple hidden onChange={(e) => { if (e.target.files) upload(e.target.files); e.target.value = ""; }} />
