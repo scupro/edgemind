@@ -94,9 +94,16 @@ export async function handleVercel(req: Request): Promise<Response> {
   const url = new URL(req.url);
   // .vercel/output/config.json routes /api/* to this one function and passes the original path along in case the rewrite changed it.
   const original = url.searchParams.get("__em_path");
+  // Vercel terminates TLS in front of the function, so the URL built by @hono/node-server is http://.
+  // Restore the client's scheme so the CSRF Origin check and Secure cookies see https.
+  const proto = req.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+  const fixProto = proto === "https" && url.protocol === "http:";
+  if (fixProto) url.protocol = "https:";
   if (original !== null) {
     url.searchParams.delete("__em_path");
     url.pathname = `/api${original.startsWith("/") ? original : original ? `/${original}` : ""}`;
+  }
+  if (original !== null || fixProto) {
     const hasBody = req.method !== "GET" && req.method !== "HEAD";
     req = new Request(url, { method: req.method, headers: req.headers, body: hasBody ? req.body : undefined, duplex: "half", signal: req.signal } as RequestInit);
   }
